@@ -1,0 +1,461 @@
+-- ============================================================
+-- Project: Credit Portfolio Risk Analysis Using SQL
+-- Author:  Hannah (Huong) Tran
+-- Analysis D: Delinquency Trends by Grade
+-- Dataset: Lending Club accepted loans, 2007-2018
+-- Table:   accepted_2007_to_2018Q4
+--
+-- Description: Default is the end of the road; delinquency is the
+--              road itself. A borrower normally moves through
+--              missed-payment stages before being charged off:
+--                Current -> Grace (1-15 DPD) -> Late 16-30 DPD
+--                -> Late 31-120 DPD -> Default -> Charged Off
+--              (DPD = days past due)
+--              Credit risk teams track these stages because they
+--              give early warning, drive provisions (IFRS 9) and
+--              tell collections where to focus.
+--
+-- Questions answered:
+--   1. How much of today's book is behind on payments, by grade?
+--   2. What provision would the arrears pipeline need (IFRS 9)?
+--   3. Once a borrower falls behind and catches up, how often do
+--      they default anyway? (re-default after cure)
+--   4. Is a borrower's PAST delinquency already priced into the
+--      grade, or is it residual risk?
+--   5. Does a recent or severe delinquency matter more than an
+--      old, minor one?
+--   6. How does borrower credit quality migrate after origination?
+--      (FICO transition matrix with an absorbing default state)
+--   7. Is a falling FICO score an early-warning signal?
+--   8. Which grades hold the most "significant increase in credit
+--      risk" (SICR) among loans that still look healthy?
+--   9. Is forbearance (hardship plans) hiding arrears?
+--
+-- KEY METHOD POINTS
+--   - Lending Club gives ONE snapshot of loan status (end-2018),
+--     not monthly history. True roll rates (e.g. % of 30 DPD loans
+--     that become 60 DPD next month) need two snapshots, so
+--     Query 2 uses clearly labelled roll-to-loss ASSUMPTIONS.
+--   - last_fico_range_low is pulled AFTER the outcome. For loans
+--     that already defaulted it reflects the default itself, so it
+--     must not be used to "predict" default on resolved loans
+--     (data leakage). Queries 7-8 use it only on live loans.
+--   - Empty CSV cells are converted to NULL (not 0) so that
+--     "never delinquent" is not confused with "0 months ago".
+--
+-- HOW TO RUN: run QUERY 0 once (it builds a helper table), click
+--   Write Changes, then highlight one query at a time and press F5.
+-- ============================================================
+
+
+-- ============================================================
+-- QUERY 0 (SETUP): Build a clean helper table
+-- ============================================================
+-- Context: Casts text columns to numbers (keeping blanks as NULL),
+-- groups loan statuses into ordered delinquency buckets, and adds
+-- flags used by every query. Runs once so later queries are fast.
+--   is_resolved = loan has a final outcome (paid, charged off,
+--                 or in Default status)
+--   is_default  = Charged Off or Default
+--   is_active   = still on the book (Current, Grace, Late, Default)
+-- 'Default' (121+ DPD, not yet charged off) counts as a bad outcome
+-- in the outcome queries and as the last arrears bucket in the
+-- pipeline queries; it is a very small group.
+
+DROP TABLE IF EXISTS delinquency_base;
+
+CREATE TABLE delinquency_base AS
+SELECT
+    id,
+    grade,
+    sub_grade,
+    loan_status,
+    CAST(SUBSTR(issue_d, -4) AS INTEGER)                    AS vintage,
+    CAST(NULLIF(funded_amnt, '')            AS REAL)        AS funded_amnt,
+    CAST(NULLIF(out_prncp, '')              AS REAL)        AS out_prncp,
+    CAST(NULLIF(int_rate, '')               AS REAL)        AS int_rate,
+    CAST(NULLIF(delinq_2yrs, '')            AS REAL)        AS delinq_2yrs,
+    CAST(NULLIF(mths_since_last_delinq, '') AS REAL)        AS mths_since_last_delinq,
+    CAST(NULLIF(num_tl_90g_dpd_24m, '')     AS REAL)        AS num_tl_90g_dpd_24m,
+    CAST(NULLIF(pub_rec_bankruptcies, '')   AS REAL)        AS pub_rec_bankruptcies,
+    CAST(NULLIF(fico_range_low, '')         AS REAL)        AS fico_orig,
+    CAST(NULLIF(last_fico_range_low, '')    AS REAL)        AS fico_latest,
+    CAST(NULLIF(total_rec_late_fee, '')     AS REAL)        AS late_fees_paid,
+    NULLIF(hardship_status, '')                             AS hardship_status,
+    CASE
+        WHEN loan_status LIKE '%Fully Paid%'    THEN '0 Fully Paid'
+        WHEN loan_status LIKE '%Charged Off%'   THEN '6 Charged Off'
+        WHEN loan_status = 'Current'            THEN '1 Current'
+        WHEN loan_status = 'In Grace Period'    THEN '2 Grace 1-15 DPD'
+        WHEN loan_status LIKE 'Late (16-30%'    THEN '3 Late 16-30 DPD'
+        WHEN loan_status LIKE 'Late (31-120%'   THEN '4 Late 31-120 DPD'
+        WHEN loan_status = 'Default'            THEN '5 Default 121+ DPD'
+        ELSE '9 Other'
+    END                                                     AS status_bucket,
+    CASE WHEN loan_status LIKE '%Charged Off%' OR loan_status = 'Default'
+         THEN 1 ELSE 0 END                                  AS is_default,
+    CASE WHEN loan_status LIKE '%Fully Paid%' OR loan_status LIKE '%Charged Off%'
+              OR loan_status = 'Default'
+         THEN 1 ELSE 0 END                                  AS is_resolved,
+    CASE WHEN loan_status IN ('Current', 'In Grace Period', 'Default')
+              OR loan_status LIKE 'Late%'
+         THEN 1 ELSE 0 END                                  AS is_active
+FROM accepted_2007_to_2018Q4
+WHERE NULLIF(issue_d, '') IS NOT NULL;
+
+-- Quick check: how many loans sit in each status bucket?
+SELECT status_bucket, COUNT(*) AS loans
+FROM delinquency_base
+GROUP BY status_bucket
+ORDER BY status_bucket;
+
+
+-- ============================================================
+-- QUERY 1: How much of the live book is behind on payments?
+--          (Arrears pipeline by grade)
+-- ============================================================
+-- Context: The standard management-information view of credit
+-- quality. For loans still on the book:
+--   pct_grace / pct_late_16_30 / pct_late_31_120 / pct_default
+--                  share of loans in each arrears bucket
+--   dq30_rate      "30+ DPD" rate = Late 31-120 + Default.
+--                  This is the headline delinquency KPI used by
+--                  banks and in IFRS 9 (30 DPD is the Stage 2
+--                  backstop).
+--   by_balance     the same rate weighted by outstanding principal
+--                  (what the lender can actually lose)
+--   x_grade_a      how many times grade A's 30+ DPD rate each
+--                  grade runs at. A well-ordered grading system
+--                  shows this rising steadily from A to G.
+
+SELECT
+    grade,
+    COUNT(*)                                                            AS active_loans,
+    ROUND(SUM(out_prncp) / 1000000.0, 2)                                AS outstanding_millions,
+    ROUND(100.0 * AVG(status_bucket = '2 Grace 1-15 DPD'), 2)           AS pct_grace,
+    ROUND(100.0 * AVG(status_bucket = '3 Late 16-30 DPD'), 2)           AS pct_late_16_30,
+    ROUND(100.0 * AVG(status_bucket = '4 Late 31-120 DPD'), 2)          AS pct_late_31_120,
+    ROUND(100.0 * AVG(status_bucket = '5 Default 121+ DPD'), 3)         AS pct_default,
+    ROUND(100.0 * AVG(status_bucket IN ('4 Late 31-120 DPD', '5 Default 121+ DPD')), 2)
+                                                                        AS dq30_rate_by_count,
+    ROUND(100.0 * SUM(CASE WHEN status_bucket IN ('4 Late 31-120 DPD', '5 Default 121+ DPD')
+                           THEN out_prncp ELSE 0 END) / NULLIF(SUM(out_prncp), 0), 2)
+                                                                        AS dq30_rate_by_balance,
+    ROUND(AVG(status_bucket IN ('4 Late 31-120 DPD', '5 Default 121+ DPD'))
+          / NULLIF(FIRST_VALUE(AVG(status_bucket IN ('4 Late 31-120 DPD', '5 Default 121+ DPD')))
+                   OVER (ORDER BY grade), 0), 1)                        AS x_grade_a
+FROM delinquency_base
+WHERE is_active = 1
+GROUP BY grade
+ORDER BY grade;
+
+
+-- ============================================================
+-- QUERY 2: What provision does the arrears pipeline need?
+--          (IFRS 9 staging + expected loss, illustrative)
+-- ============================================================
+-- Context: Each arrears bucket is mapped to an IFRS 9 stage and
+-- given a "roll-to-loss" rate = probability the balance ends up
+-- charged off. Expected loss = outstanding x roll-to-loss x LGD.
+--   Stage 1           performing (12-month expected loss)
+--   Stage 1 watch     1-30 DPD: still Stage 1, but on a watch-list
+--   Stage 2           30+ DPD rebuttable presumption of a
+--                     significant increase in credit risk (lifetime
+--                     expected loss). Late 31-120 also contains
+--                     90+ DPD loans that would be Stage 3; one
+--                     snapshot cannot split them.
+--   Stage 3           credit-impaired (Default bucket)
+-- !! The roll-to-loss rates and LGD below are ILLUSTRATIVE
+--    ASSUMPTIONS, not estimates from this data. Replace them with:
+--      - Current: 12-month cumulative PD from Analysis C, Query 4
+--      - LGD: from Analysis C, Query 7
+--    and change them to test sensitivity.
+-- coverage_pct = expected loss / outstanding = the provision a
+-- bank would hold per 100 of balance.
+
+WITH assumptions(status_bucket, ifrs9_stage, roll_to_loss) AS (
+    VALUES
+        ('1 Current',          'Stage 1',       0.03),
+        ('2 Grace 1-15 DPD',   'Stage 1 watch', 0.25),
+        ('3 Late 16-30 DPD',   'Stage 1 watch', 0.45),
+        ('4 Late 31-120 DPD',  'Stage 2',       0.75),
+        ('5 Default 121+ DPD', 'Stage 3',       0.95)
+),
+params(lgd) AS (
+    VALUES (0.85)
+)
+SELECT
+    d.grade,
+    ROUND(SUM(d.out_prncp) / 1000000.0, 2)                                          AS outstanding_millions,
+    ROUND(100.0 * SUM(CASE WHEN a.ifrs9_stage = 'Stage 1'       THEN d.out_prncp ELSE 0 END) / SUM(d.out_prncp), 2) AS pct_stage_1,
+    ROUND(100.0 * SUM(CASE WHEN a.ifrs9_stage = 'Stage 1 watch' THEN d.out_prncp ELSE 0 END) / SUM(d.out_prncp), 2) AS pct_watch_list,
+    ROUND(100.0 * SUM(CASE WHEN a.ifrs9_stage = 'Stage 2'       THEN d.out_prncp ELSE 0 END) / SUM(d.out_prncp), 2) AS pct_stage_2,
+    ROUND(100.0 * SUM(CASE WHEN a.ifrs9_stage = 'Stage 3'       THEN d.out_prncp ELSE 0 END) / SUM(d.out_prncp), 3) AS pct_stage_3,
+    ROUND(SUM(d.out_prncp * a.roll_to_loss * p.lgd) / 1000000.0, 2)                 AS expected_loss_millions,
+    ROUND(100.0 * SUM(d.out_prncp * a.roll_to_loss * p.lgd) / SUM(d.out_prncp), 2)  AS coverage_pct
+FROM delinquency_base d
+JOIN assumptions a ON d.status_bucket = a.status_bucket
+CROSS JOIN params p
+GROUP BY d.grade
+ORDER BY d.grade;
+
+
+-- ============================================================
+-- QUERY 3: After a borrower falls behind and catches up, how
+--          often do they default anyway? (re-default after cure)
+-- ============================================================
+-- Context: A late fee is only collected when a borrower missed a
+-- due date AND later paid. So late_fees_paid > 0 marks a "cured"
+-- delinquency. Comparing their final default rate with the grade
+-- average shows how much risk remains after a cure.
+-- This matters for collections strategy and for IFRS 9 "probation
+-- periods": regulators expect cured loans to stay in a higher
+-- stage for a time because re-default risk is elevated.
+-- Limitation: borrowers who fell behind and never paid again carry
+-- no late fee, so this measures re-default AFTER a cure, not the
+-- full roll rate from first delinquency to loss.
+
+SELECT
+    grade,
+    COUNT(*)                                                                AS resolved_loans,
+    ROUND(100.0 * AVG(COALESCE(late_fees_paid, 0) > 0), 2)                  AS pct_cured_delinquency,
+    ROUND(100.0 * AVG(is_default), 2)                                       AS grade_default_pct,
+    ROUND(100.0 * AVG(CASE WHEN late_fees_paid > 0 THEN is_default END), 2) AS default_pct_after_cure,
+    ROUND(AVG(CASE WHEN late_fees_paid > 0 THEN is_default END)
+          / NULLIF(AVG(is_default), 0), 2)                                  AS re_default_multiple
+FROM delinquency_base
+WHERE is_resolved = 1
+GROUP BY grade
+ORDER BY grade;
+
+
+-- ============================================================
+-- QUERY 4: Is past delinquency already priced into the grade?
+-- ============================================================
+-- Context: Each grade is split by the borrower's credit-bureau
+-- history at application:
+--   1 Clean                no delinquency in 2 years, no bankruptcy
+--   2 One delinquency      exactly one 30+ DPD event in 2 years
+--   3 Repeat / bankruptcy  2+ delinquencies or a past bankruptcy
+-- If the grading model fully captured history, default rates would
+-- be similar across these groups within a grade.
+--   extra_default_pp   default rate above the Clean group of the
+--                      same grade (lifetime, percentage points)
+--   extra_rate_pp      interest rate charged above the Clean group
+--                      (per year, percentage points)
+-- The two are in different units, so read the SIGNAL, not the
+-- ratio: higher default with little or no extra rate means past
+-- delinquency is residual, under-priced risk.
+
+WITH r AS (
+    SELECT
+        grade,
+        int_rate,
+        is_default,
+        CASE
+            WHEN COALESCE(delinq_2yrs, 0) = 0 AND COALESCE(pub_rec_bankruptcies, 0) = 0
+                THEN '1 Clean'
+            WHEN delinq_2yrs >= 2 OR pub_rec_bankruptcies > 0
+                THEN '3 Repeat / bankruptcy'
+            ELSE '2 One delinquency'
+        END AS history
+    FROM delinquency_base
+    WHERE is_resolved = 1
+),
+clean AS (
+    SELECT grade, AVG(is_default) AS pd_clean, AVG(int_rate) AS rate_clean
+    FROM r
+    WHERE history = '1 Clean'
+    GROUP BY grade
+)
+SELECT
+    r.grade,
+    r.history,
+    COUNT(*)                                            AS loans,
+    ROUND(AVG(r.int_rate), 2)                           AS avg_interest_rate,
+    ROUND(100.0 * AVG(r.is_default), 2)                 AS default_pct,
+    ROUND(100.0 * (AVG(r.is_default) - c.pd_clean), 2)  AS extra_default_pp,
+    ROUND(AVG(r.int_rate) - c.rate_clean, 2)            AS extra_rate_pp
+FROM r
+JOIN clean c ON r.grade = c.grade
+GROUP BY r.grade, r.history, c.pd_clean, c.rate_clean
+HAVING COUNT(*) >= 300
+ORDER BY r.grade, r.history;
+
+
+-- ============================================================
+-- QUERY 5: Recency and severity of past delinquency
+-- ============================================================
+-- Context: Credit scoring (e.g. Altman-style scoring models,
+-- bureau scores) weights recent and severe events more heavily
+-- than old, minor ones. This tests that idea on actual outcomes:
+--   recency  = months since the borrower's last delinquency
+--              (blank in the data = never delinquent)
+--   severity = any account 90+ DPD in the last 24 months
+-- Grades are grouped into three bands to keep cells large enough
+-- to be statistically meaningful.
+-- An analyst uses this to set policy rules, e.g. "decline if a
+-- 90+ DPD event in the last 12 months", and to check that the
+-- rule would actually reduce losses.
+
+SELECT
+    CASE WHEN grade IN ('A', 'B') THEN '1 A-B'
+         WHEN grade IN ('C', 'D') THEN '2 C-D'
+         ELSE '3 E-G' END                                                   AS grade_band,
+    CASE WHEN mths_since_last_delinq IS NULL THEN '1 Never delinquent'
+         WHEN mths_since_last_delinq <= 12   THEN '2 Within 12 months'
+         WHEN mths_since_last_delinq <= 24   THEN '3 13-24 months ago'
+         WHEN mths_since_last_delinq <= 48   THEN '4 25-48 months ago'
+         ELSE '5 Over 48 months ago' END                                    AS last_delinquency,
+    COUNT(*)                                                                AS loans,
+    ROUND(100.0 * AVG(is_default), 2)                                       AS default_pct,
+    ROUND(100.0 * AVG(COALESCE(num_tl_90g_dpd_24m, 0) > 0), 1)              AS pct_with_90dpd_24m,
+    ROUND(100.0 * AVG(CASE WHEN num_tl_90g_dpd_24m > 0 THEN is_default END), 2)
+                                                                            AS default_pct_if_90dpd,
+    ROUND(100.0 * AVG(CASE WHEN COALESCE(num_tl_90g_dpd_24m, 0) = 0 THEN is_default END), 2)
+                                                                            AS default_pct_no_90dpd
+FROM delinquency_base
+WHERE is_resolved = 1
+GROUP BY grade_band, last_delinquency
+ORDER BY grade_band, last_delinquency;
+
+
+-- ============================================================
+-- QUERY 6: Credit quality migration - FICO transition matrix
+-- ============================================================
+-- Context: This is the retail-loan version of the rating
+-- transition matrix in CQF M5S8. Rows = FICO band at origination,
+-- columns = latest FICO band, plus an absorbing DEFAULT state
+-- (once defaulted, a loan cannot migrate back), exactly like the
+-- "D" column of an agency migration matrix.
+-- Each row sums to 100%. Read it as: "of borrowers who started in
+-- this band, what % are now in each band, or have defaulted?"
+--   pct_downgraded / pct_upgraded = movement off the diagonal
+-- Paid-off loans keep their latest bureau score; loans with no
+-- valid latest score (below 300) are excluded unless defaulted.
+
+WITH m AS (
+    SELECT
+        CASE WHEN fico_orig < 640 THEN '1 <640'
+             WHEN fico_orig < 680 THEN '2 640-679'
+             WHEN fico_orig < 720 THEN '3 680-719'
+             WHEN fico_orig < 760 THEN '4 720-759'
+             ELSE '5 760+' END                         AS fico_at_origination,
+        CASE WHEN is_default = 1     THEN 'D'
+             WHEN fico_latest < 640  THEN '1'
+             WHEN fico_latest < 680  THEN '2'
+             WHEN fico_latest < 720  THEN '3'
+             WHEN fico_latest < 760  THEN '4'
+             ELSE '5' END                              AS latest_state
+    FROM delinquency_base
+    WHERE fico_orig IS NOT NULL
+      AND (is_default = 1 OR fico_latest >= 300)
+)
+SELECT
+    fico_at_origination,
+    COUNT(*)                                                                AS loans,
+    ROUND(100.0 * AVG(latest_state = '1'), 1)                               AS to_below_640,
+    ROUND(100.0 * AVG(latest_state = '2'), 1)                               AS to_640_679,
+    ROUND(100.0 * AVG(latest_state = '3'), 1)                               AS to_680_719,
+    ROUND(100.0 * AVG(latest_state = '4'), 1)                               AS to_720_759,
+    ROUND(100.0 * AVG(latest_state = '5'), 1)                               AS to_760_plus,
+    ROUND(100.0 * AVG(latest_state = 'D'), 1)                               AS to_default,
+    ROUND(100.0 * AVG(latest_state <> 'D'
+                      AND latest_state < SUBSTR(fico_at_origination, 1, 1)), 1) AS pct_downgraded,
+    ROUND(100.0 * AVG(latest_state <> 'D'
+                      AND latest_state > SUBSTR(fico_at_origination, 1, 1)), 1) AS pct_upgraded
+FROM m
+GROUP BY fico_at_origination
+ORDER BY fico_at_origination;
+
+
+-- ============================================================
+-- QUERY 7: Is a falling FICO score an early-warning signal?
+-- ============================================================
+-- Context: Using only LIVE loans (to avoid post-default leakage),
+-- loans are grouped by how far the borrower's FICO has moved since
+-- origination. If falling scores line up with being behind on
+-- payments, the bureau score is a usable early-warning trigger for
+-- monitoring and collections.
+-- Caution: missing payments also lowers FICO, so this shows
+-- association, not proof that the FICO drop came first.
+
+SELECT
+    CASE WHEN fico_latest - fico_orig >= 0   THEN '1 Stable or improved'
+         WHEN fico_latest - fico_orig > -40  THEN '2 Drop of 1-39'
+         WHEN fico_latest - fico_orig > -80  THEN '3 Drop of 40-79'
+         ELSE '4 Drop of 80+' END                                   AS fico_change,
+    COUNT(*)                                                        AS live_loans,
+    ROUND(SUM(out_prncp) / 1000000.0, 2)                            AS outstanding_millions,
+    ROUND(100.0 * AVG(status_bucket <> '1 Current'), 2)             AS pct_behind_on_payments,
+    ROUND(100.0 * AVG(status_bucket IN ('4 Late 31-120 DPD', '5 Default 121+ DPD')), 2)
+                                                                    AS dq30_rate
+FROM delinquency_base
+WHERE is_active = 1
+  AND fico_orig IS NOT NULL
+  AND fico_latest >= 300
+GROUP BY fico_change
+ORDER BY fico_change;
+
+
+-- ============================================================
+-- QUERY 8: Hidden deterioration - SICR watch-list among loans
+--          that are still Current
+-- ============================================================
+-- Context: IFRS 9 requires moving a loan to Stage 2 when credit
+-- risk has increased significantly (SICR), even if it is still
+-- paying on time. A large FICO drop since origination is a
+-- common quantitative SICR trigger. This query sizes, by grade,
+-- the Current loans that would be caught by a 40-point and an
+-- 80-point trigger: risk that the 30+ DPD rate in Query 1 does
+-- not yet show.
+
+SELECT
+    grade,
+    COUNT(*)                                                                AS current_loans,
+    ROUND(SUM(out_prncp) / 1000000.0, 2)                                    AS outstanding_millions,
+    ROUND(AVG(fico_latest - fico_orig), 1)                                  AS avg_fico_change,
+    ROUND(100.0 * AVG(fico_latest - fico_orig <= -40), 2)                   AS pct_drop_40_plus,
+    ROUND(100.0 * AVG(fico_latest - fico_orig <= -80), 2)                   AS pct_drop_80_plus,
+    ROUND(SUM(CASE WHEN fico_latest - fico_orig <= -40 THEN out_prncp ELSE 0 END)
+          / 1000000.0, 2)                                                   AS sicr_watchlist_millions
+FROM delinquency_base
+WHERE status_bucket = '1 Current'
+  AND fico_orig IS NOT NULL
+  AND fico_latest >= 300
+GROUP BY grade
+ORDER BY grade;
+
+
+-- ============================================================
+-- QUERY 9: Is forbearance hiding arrears? (hardship plans)
+-- ============================================================
+-- Context: Borrowers on a hardship plan make reduced or deferred
+-- payments but can still be reported as "Current". Headline
+-- delinquency then understates true stress, a key concern for
+-- regulators (forbearance must be identified and monitored).
+--   pct_ever_hardship        share of loans that entered a plan
+--   pct_plans_broken         plans the borrower failed to keep
+--   default_pct_after_plan   final default rate of resolved loans
+--                            that had a plan, vs those that did not
+--   pct_current_on_plan      share of "Current" loans that are
+--                            only current because of an ACTIVE plan
+-- Hardship plans started late in the data period, so counts are
+-- small; treat this as a monitoring framework rather than a
+-- precise estimate.
+
+SELECT
+    grade,
+    COUNT(*)                                                                    AS loans,
+    ROUND(100.0 * AVG(hardship_status IS NOT NULL), 2)                          AS pct_ever_hardship,
+    ROUND(100.0 * AVG(CASE WHEN hardship_status = 'BROKEN' THEN 1.0
+                           WHEN hardship_status IS NOT NULL THEN 0.0 END), 1)   AS pct_plans_broken,
+    ROUND(100.0 * AVG(CASE WHEN is_resolved = 1 AND hardship_status IS NOT NULL
+                           THEN is_default END), 1)                             AS default_pct_after_plan,
+    ROUND(100.0 * AVG(CASE WHEN is_resolved = 1 AND hardship_status IS NULL
+                           THEN is_default END), 1)                             AS default_pct_no_plan,
+    ROUND(100.0 * AVG(CASE WHEN status_bucket = '1 Current' AND hardship_status = 'ACTIVE' THEN 1.0
+                           WHEN status_bucket = '1 Current' THEN 0.0 END), 3)   AS pct_current_on_plan
+FROM delinquency_base
+GROUP BY grade
+ORDER BY grade;
