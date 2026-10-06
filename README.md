@@ -18,7 +18,8 @@ Default is the end of the road; delinquency is the road itself. A borrower typic
 
 ```
 Current → Grace (1–15 DPD) → Late 16–30 DPD → Late 31–120 DPD → Default (121+ DPD) → Charged Off
-```
+
+
 
 Credit risk teams monitor these stages because they provide early warning, determine IFRS 9 staging and provisions, and show collections teams where to focus. This analysis looks at both sides of delinquency: the **current arrears status of each loan** and the **borrower's credit-bureau delinquency history** at application.
 
