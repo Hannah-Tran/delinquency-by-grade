@@ -11,12 +11,11 @@ To replicate the arrears monitoring a retail credit risk team performs: tracking
 - GitHub (project documentation)
 - Dataset: [Lending Club Loan Data 2007–2018](https://www.kaggle.com/datasets/wordsforthewise/lending-club) via Kaggle
 
-```
 
 ## 🔄 Why Delinquency Matters
 Default is the end of the road; delinquency is the road itself. A borrower typically moves through these stages before a loan is written off:
 
-```
+
 Current → Grace (1–15 DPD) → Late 16–30 DPD → Late 31–120 DPD → Default (121+ DPD) → Charged Off
 
 
